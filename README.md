@@ -1,6 +1,6 @@
 # LightPhon Node Client
 
-A Windows desktop application to connect your GPU to the AI Lightning network and earn Bitcoin (sats) by providing AI inference services.
+A Windows desktop application to connect your GPU to the AI Lightning network of LightPhon and earn Bitcoin (sats) by providing AI inference services.
 
 ## 📋 Requirements
 
@@ -74,4 +74,5 @@ MIT License - See [LICENSE](LICENSE) for details.
 ## 🤝 Support
 
 For issues and feature requests, please open an issue on GitHub.
+
 
