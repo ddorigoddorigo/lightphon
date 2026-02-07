@@ -22,7 +22,7 @@ winget install Microsoft.VCRedist.2015+.x64
 Install **llama.cpp** which includes llama-server:
 
 ```powershell
-winget install ggerganov.llama-server
+winget install llama.cpp
 ```
 
 After installation, verify it's installed correctly:
@@ -39,24 +39,21 @@ llama-server --version
 
 On first run, you'll need to:
 
-1. Enter the server URL: `http://51.178.142.183:5000`
-2. Set your Lightning wallet address to receive payments
-3. Select the folder containing your GGUF models
-4. Choose which models to make available on the network
+1. Select the folder containing your GGUF models
+2. Choose which models to make available on the network
 
 ## 💡 How it Works
 
 1. **Connect** - The app connects to the AI Lightning network
 2. **Share Models** - Your selected AI models become available for users
 3. **Earn Sats** - When users run inference on your models, you earn Bitcoin via Lightning Network
-4. **Auto-Payments** - Payments are sent directly to your Lightning wallet
 
 ## 🔧 Troubleshooting
 
 ### "llama-server not found"
 Make sure llama-server is installed and in your PATH:
 ```powershell
-winget install ggerganov.llama-server
+winget install llama.cpp
 ```
 
 ### "VCRUNTIME140.dll not found"
@@ -77,3 +74,4 @@ MIT License - See [LICENSE](LICENSE) for details.
 ## 🤝 Support
 
 For issues and feature requests, please open an issue on GitHub.
+
