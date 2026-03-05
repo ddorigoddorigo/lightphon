@@ -1,0 +1,42 @@
+# Config with secrets
+config.ini
+node_config.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+env/
+.venv/
+ENV/
+*.egg
+*.egg-info/
+
+# Build artifacts
+build/
+dist/
+installer_output/
+*.spec
+$null
+
+# Logs
+*.log
+logs/
+
+# Models (large files)
+models/
+*.gguf
+*.bin
+*.ggml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# RAG data
+rag_data/
+uploads/
