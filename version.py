@@ -3,8 +3,8 @@ Version information for the node-client.
 This file is auto-updated during the build process.
 """
 
-VERSION = "1.0.11"
-VERSION_DATE = "2026-02-12"
+VERSION = "1.0.12"
+VERSION_DATE = "2026-04-17"
 
 # Per confronto versioni
 def parse_version(version_str):
