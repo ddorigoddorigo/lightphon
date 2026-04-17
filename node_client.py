@@ -24,9 +24,6 @@ from flask import Flask, request, jsonify
 from version import VERSION
 from rag_manager import RAGManager, read_document
 
-# Disabilita warning SSL per certificati self-signed
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -92,7 +89,7 @@ class NodeLightning:
                     'memo': memo,
                     'expiry': '600'  # 10 minuti
                 },
-                verify=False,
+                verify=self._cert_path if (self._cert_path and os.path.isfile(self._cert_path)) else True,
                 timeout=10
             )
             
