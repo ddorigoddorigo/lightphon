@@ -89,7 +89,7 @@ class NodeLightning:
                     'memo': memo,
                     'expiry': '600'  # 10 minuti
                 },
-                verify=self._cert_path if (self._cert_path and os.path.isfile(self._cert_path)) else True,
+                verify=self._cert_path if (self._cert_path and os.path.isfile(self._cert_path)) else False,
                 timeout=10
             )
             
