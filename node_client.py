@@ -884,13 +884,23 @@ class NodeClient:
                 self.sio.emit('node_models_update', sync_data)
                 logger.info(f"Auto-synced {len(self.models)} models after registration")
         
+        # Track sessions currently being started (prevents duplicate start_session handling)
+        _starting_sessions = set()
+
         @self.sio.on('start_session')
         def on_start_session(data):
             """Richiesta di avviare una sessione"""
             logger.info(f"=== RECEIVED start_session event ===")
             logger.info(f"start_session data: {data}")
-            
+
             session_id = str(data['session_id'])
+
+            # Guard: ignore duplicate start_session for the same session
+            if session_id in _starting_sessions or session_id in self.active_sessions:
+                logger.warning(f"Ignoring duplicate start_session for {session_id}")
+                return
+            _starting_sessions.add(session_id)
+
             model_id = data.get('model_id') or data.get('model')
             model_name = data.get('model_name', model_id)
             context = data.get('context', 2048)
@@ -1059,33 +1069,36 @@ class NodeClient:
 
             def _do_start():
                 """Run llama.start() in a background thread so SocketIO stays responsive."""
-                if llama.start(download_callback=status_callback):
-                    self.active_sessions[session_id] = llama
+                try:
+                    if llama.start(download_callback=status_callback):
+                        self.active_sessions[session_id] = llama
 
-                    # Track model usage - increment use_count
-                    if self.model_manager and model_id:
-                        self.model_manager.mark_model_used(model_id)
-                        logger.info(f"Updated usage stats for model {model_id}")
+                        # Track model usage - increment use_count
+                        if self.model_manager and model_id:
+                            self.model_manager.mark_model_used(model_id)
+                            logger.info(f"Updated usage stats for model {model_id}")
 
-                    if self.sio.connected:
-                        self.sio.emit('session_started', {
-                            'session_id': session_id,
-                            'node_id': self.node_id,
-                            'status': 'ready'
-                        })
+                        if self.sio.connected:
+                            self.sio.emit('session_started', {
+                                'session_id': session_id,
+                                'node_id': self.node_id,
+                                'status': 'ready'
+                            })
+                        else:
+                            logger.warning(f"Cannot emit session_started: socket disconnected")
+                            llama.stop()
+                            self.active_sessions.pop(session_id, None)
                     else:
-                        logger.warning(f"Cannot emit session_started: socket disconnected")
-                        llama.stop()
-                        self.active_sessions.pop(session_id, None)
-                else:
-                    if self.sio.connected:
-                        self.sio.emit('session_error', {
-                            'session_id': session_id,
-                            'node_id': self.node_id,
-                            'error': 'Failed to start llama-server (check logs for details)'
-                        })
-                    else:
-                        logger.warning(f"Cannot emit session_error: socket disconnected")
+                        if self.sio.connected:
+                            self.sio.emit('session_error', {
+                                'session_id': session_id,
+                                'node_id': self.node_id,
+                                'error': 'Failed to start llama-server (check logs for details)'
+                            })
+                        else:
+                            logger.warning(f"Cannot emit session_error: socket disconnected")
+                finally:
+                    _starting_sessions.discard(session_id)
 
             import threading as _threading_mod
             _threading_mod.Thread(target=_do_start, daemon=True).start()
