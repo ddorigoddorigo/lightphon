@@ -3,7 +3,7 @@ Version information for the node-client.
 This file is auto-updated during the build process.
 """
 
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 VERSION_DATE = "2026-06-26"
 
 # Per confronto versioni

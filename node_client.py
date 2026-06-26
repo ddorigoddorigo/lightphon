@@ -1056,35 +1056,39 @@ class NodeClient:
                         })
                 except Exception as e:
                     logger.warning(f"Failed to emit status update: {e}")
-            
-            if llama.start(download_callback=status_callback):
-                self.active_sessions[session_id] = llama
-                
-                # Track model usage - increment use_count
-                if self.model_manager and model_id:
-                    self.model_manager.mark_model_used(model_id)
-                    logger.info(f"Updated usage stats for model {model_id}")
-                
-                if self.sio.connected:
-                    self.sio.emit('session_started', {
-                        'session_id': session_id,
-                        'node_id': self.node_id,
-                        'status': 'ready'
-                    })
+
+            def _do_start():
+                """Run llama.start() in a background thread so SocketIO stays responsive."""
+                if llama.start(download_callback=status_callback):
+                    self.active_sessions[session_id] = llama
+
+                    # Track model usage - increment use_count
+                    if self.model_manager and model_id:
+                        self.model_manager.mark_model_used(model_id)
+                        logger.info(f"Updated usage stats for model {model_id}")
+
+                    if self.sio.connected:
+                        self.sio.emit('session_started', {
+                            'session_id': session_id,
+                            'node_id': self.node_id,
+                            'status': 'ready'
+                        })
+                    else:
+                        logger.warning(f"Cannot emit session_started: socket disconnected")
+                        llama.stop()
+                        self.active_sessions.pop(session_id, None)
                 else:
-                    logger.warning(f"Cannot emit session_started: socket disconnected")
-                    # Clean up the session since we can't notify the server
-                    llama.stop()
-                    del self.active_sessions[session_id]
-            else:
-                if self.sio.connected:
-                    self.sio.emit('session_error', {
-                        'session_id': session_id,
-                        'node_id': self.node_id,
-                        'error': 'Failed to start llama-server (check logs for details)'
-                    })
-                else:
-                    logger.warning(f"Cannot emit session_error: socket disconnected")
+                    if self.sio.connected:
+                        self.sio.emit('session_error', {
+                            'session_id': session_id,
+                            'node_id': self.node_id,
+                            'error': 'Failed to start llama-server (check logs for details)'
+                        })
+                    else:
+                        logger.warning(f"Cannot emit session_error: socket disconnected")
+
+            import threading as _threading_mod
+            _threading_mod.Thread(target=_do_start, daemon=True).start()
         
         @self.sio.on('stop_session')
         def on_stop_session(data):
