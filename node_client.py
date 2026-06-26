@@ -873,6 +873,16 @@ class NodeClient:
             if data.get('token'):
                 self.node_token = data['token']
                 self._save_token(data['token'])
+            # Sync models now that node_id is known
+            if self.models:
+                sync_data = {
+                    'node_id': self.node_id,
+                    'models': self.models,
+                }
+                if self.hardware_info:
+                    sync_data['hardware'] = self.hardware_info
+                self.sio.emit('node_models_update', sync_data)
+                logger.info(f"Auto-synced {len(self.models)} models after registration")
         
         @self.sio.on('start_session')
         def on_start_session(data):
@@ -924,8 +934,13 @@ class NodeClient:
                     logger.info(f"get_model_by_name({model_name}) returned: {model_info}")
                 
                 if model_info:
-                    # Check if it's a HuggingFace model
-                    if hasattr(model_info, 'hf_repo') and model_info.hf_repo:
+                    # If the model is in the local HuggingFace cache (filepath exists),
+                    # load it directly — no need to re-download via -hf flag.
+                    if hasattr(model_info, 'filepath') and model_info.filepath and os.path.exists(model_info.filepath):
+                        model_source = model_info.filepath
+                        use_hf = False
+                        logger.info(f"Using locally cached HuggingFace model: {model_source}")
+                    elif hasattr(model_info, 'hf_repo') and model_info.hf_repo:
                         model_source = model_info.hf_repo
                         use_hf = True
                         logger.info(f"Found HuggingFace model: {model_source}")
