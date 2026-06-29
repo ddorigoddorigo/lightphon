@@ -385,21 +385,178 @@ class ModelManager:
         except Exception as e:
             logger.error(f"Error saving config: {e}")
     
-    def scan_models(self) -> List[ModelInfo]:
-        """Scan directory for GGUF files."""
+    def scan_huggingface_cache(self, hf_cache_dir: str = None) -> List[ModelInfo]:
+        """
+        Scan the HuggingFace hub cache for already-downloaded GGUF models.
+
+        The cache structure is:
+          <hf_cache_dir>/models--<org>--<repo>/snapshots/<hash>/[subfolder/]<file>.gguf
+
+        Args:
+            hf_cache_dir: Path to the HuggingFace hub cache directory.
+                          Defaults to ~/.cache/huggingface/hub
+
+        Returns:
+            List of ModelInfo objects found in the cache
+        """
+        import re as _re
+
+        if hf_cache_dir is None:
+            hf_cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'huggingface', 'hub')
+
+        if not os.path.exists(hf_cache_dir):
+            logger.info(f"HuggingFace cache not found at: {hf_cache_dir}")
+            return []
+
         found_models = []
-        
+
+        for entry in os.listdir(hf_cache_dir):
+            if not entry.startswith('models--'):
+                continue
+
+            # Parse org/repo from dir name: models--org--repo → org/repo
+            remainder = entry[len('models--'):]
+            parts = remainder.split('--', 1)
+            if len(parts) != 2:
+                continue
+            org, repo = parts
+            hf_repo_base = f"{org}/{repo}"
+
+            model_dir = os.path.join(hf_cache_dir, entry)
+            snapshots_dir = os.path.join(model_dir, 'snapshots')
+            if not os.path.exists(snapshots_dir):
+                continue
+
+            # Use the most recently modified snapshot
+            snapshots = [
+                s for s in os.listdir(snapshots_dir)
+                if os.path.isdir(os.path.join(snapshots_dir, s))
+            ]
+            if not snapshots:
+                continue
+            snapshot_hash = sorted(
+                snapshots,
+                key=lambda s: os.path.getmtime(os.path.join(snapshots_dir, s)),
+                reverse=True
+            )[0]
+            snapshot_dir = os.path.join(snapshots_dir, snapshot_hash)
+
+            # Walk the snapshot directory recursively and collect GGUF files
+            gguf_files = []
+            for root, dirs, files in os.walk(snapshot_dir):
+                for filename in files:
+                    if not filename.lower().endswith('.gguf'):
+                        continue
+                    # Skip multimodal projectors
+                    if 'mmproj' in filename.lower() or 'clip' in filename.lower():
+                        logger.info(f"Skipping mmproj/CLIP file: {filename}")
+                        continue
+                    # For split GGUF files keep only the first shard
+                    split_match = _re.search(r'-(\d+)-of-(\d+)\.gguf$', filename, _re.IGNORECASE)
+                    if split_match:
+                        part_num = int(split_match.group(1))
+                        if part_num != 1:
+                            continue  # skip shards 2, 3, ...
+                    gguf_files.append(os.path.join(root, filename))
+
+            for filepath in gguf_files:
+                filename = os.path.basename(filepath)
+
+                # Subfolder relative to snapshot root (e.g. "UD-Q4_K_M")
+                subfolder = os.path.relpath(os.path.dirname(filepath), snapshot_dir)
+                if subfolder == '.':
+                    subfolder = ''
+
+                # Build hf_repo identifier (include subfolder as quant hint)
+                hf_repo = f"{hf_repo_base}:{subfolder}" if subfolder else hf_repo_base
+
+                # Build model ID
+                try:
+                    model_id = calculate_file_hash(filepath)
+                except Exception as e:
+                    logger.warning(f"Could not hash {filepath}: {e}")
+                    model_id = hashlib.md5(filepath.encode()).hexdigest()[:16]
+
+                # If already registered just refresh the filepath
+                if model_id in self.models:
+                    self.models[model_id].filepath = filepath
+                    found_models.append(self.models[model_id])
+                    continue
+
+                # Parse info from filename and repo name
+                parsed = parse_model_name(filename)
+                repo_parsed = parse_huggingface_repo(hf_repo)
+
+                # Prefer repo-level metadata when filename parsing is poor
+                if parsed['parameters'] == 'Unknown' and repo_parsed['parameters'] != 'Unknown':
+                    parsed['parameters'] = repo_parsed['parameters']
+                if parsed['architecture'] == 'unknown' and repo_parsed['architecture'] != 'unknown':
+                    parsed['architecture'] = repo_parsed['architecture']
+                if parsed['quantization'] == 'Unknown' and repo_parsed['quantization'] != 'Unknown':
+                    parsed['quantization'] = repo_parsed['quantization']
+
+                vram_req = get_vram_requirements(parsed['parameters'])
+
+                # Estimate total size (split files: multiply first-shard size by #shards)
+                try:
+                    size_bytes = os.path.getsize(filepath)
+                    split_match = _re.search(r'-(\d+)-of-(\d+)\.gguf$', filename, _re.IGNORECASE)
+                    if split_match:
+                        total_parts = int(split_match.group(2))
+                        size_bytes = size_bytes * total_parts  # rough estimate
+                except Exception:
+                    size_bytes = 0
+
+                display_name = parsed['name']
+                if display_name == filename.replace('.gguf', '').replace('.GGUF', ''):
+                    display_name = repo_parsed['name']
+
+                model = ModelInfo(
+                    id=model_id,
+                    name=display_name,
+                    filename=filename,
+                    filepath=filepath,
+                    size_bytes=size_bytes,
+                    size_gb=round(size_bytes / (1024 ** 3), 2),
+                    parameters=parsed['parameters'],
+                    quantization=parsed['quantization'],
+                    context_length=4096,
+                    architecture=parsed['architecture'],
+                    created_at=datetime.fromtimestamp(os.path.getctime(filepath)).isoformat(),
+                    min_vram_mb=vram_req['min'],
+                    recommended_vram_mb=vram_req['rec'],
+                    enabled=True,
+                    hf_repo=hf_repo,
+                    is_huggingface=True
+                )
+
+                self.models[model_id] = model
+                found_models.append(model)
+                logger.info(
+                    f"Found HuggingFace cached model: {model.name} "
+                    f"({model.size_gb:.2f} GB) at {filepath}"
+                )
+
+        if found_models:
+            self.save_config()
+
+        return found_models
+
+    def scan_models(self) -> List[ModelInfo]:
+        """Scan local models directory and HuggingFace cache for GGUF files."""
+        found_models = []
+
         if not os.path.exists(self.models_dir):
             logger.warning(f"Models directory does not exist: {self.models_dir}")
             return found_models
-        
+
         for filename in os.listdir(self.models_dir):
             if filename.lower().endswith('.gguf'):
                 # Skip mmproj/CLIP files - these are multimodal projectors, not main models
                 if 'mmproj' in filename.lower() or 'clip' in filename.lower():
                     logger.info(f"Skipping mmproj/CLIP file (not a main model): {filename}")
                     continue
-                
+
                 filepath = os.path.join(self.models_dir, filename)
                 
                 try:
@@ -446,19 +603,25 @@ class ModelManager:
                 except Exception as e:
                     logger.error(f"Error scanning {filename}: {e}")
         
-        # Remove models no longer present
+        # Also scan HuggingFace hub cache
+        hf_cached = self.scan_huggingface_cache()
+        for m in hf_cached:
+            if m not in found_models:
+                found_models.append(m)
+
+        # Remove models no longer present on disk
         to_remove = []
         for model_id, model in self.models.items():
-            if not os.path.exists(model.filepath):
+            if model.filepath and not os.path.exists(model.filepath):
                 to_remove.append(model_id)
-        
+
         for model_id in to_remove:
             logger.info(f"Removing missing model: {self.models[model_id].name}")
             del self.models[model_id]
-        
+
         # Salva configurazione
         self.save_config()
-        
+
         return list(self.models.values())
     
     def get_enabled_models(self) -> List[ModelInfo]:

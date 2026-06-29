@@ -981,7 +981,7 @@ class NodeGUI:
         ttk.Label(details_frame, textvariable=self.model_details, font=('Arial', 9)).pack(anchor='w')
         
         # Note about context
-        ttk.Label(details_frame, text="ℹ️ Context length is set by the user when creating a session", 
+        ttk.Label(details_frame, text="ℹ️ Double-click the Context column to change the context length for a model", 
                   font=('Arial', 8), foreground='gray').pack(anchor='w', pady=5)
         
         self.models_tree.bind('<<TreeviewSelect>>', self._on_model_select)
@@ -1713,7 +1713,49 @@ class NodeGUI:
                     
                     # Save to config and sync to server
                     self._save_restricted_config()
+
+                elif column == '#9':  # Context column
+                    self._edit_context_length(model_id, model)
     
+    def _edit_context_length(self, model_id, model):
+        """Open a small dialog to edit the context length of a model."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Context Length")
+        dialog.geometry("320x130")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text=f"Model: {model.filename or model.name}", font=('Arial', 9, 'bold')).pack(padx=15, pady=(12, 4))
+        ttk.Label(dialog, text="Context length (tokens):").pack(padx=15, anchor='w')
+
+        var = tk.StringVar(value=str(model.context_length))
+        entry = ttk.Entry(dialog, textvariable=var, width=18)
+        entry.pack(padx=15, pady=4, anchor='w')
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        def _apply():
+            try:
+                new_ctx = int(var.get().strip())
+                if new_ctx < 512:
+                    raise ValueError("Minimum 512")
+                self.model_manager.set_model_context_length(model_id, new_ctx)
+                # Update treeview cell
+                values = list(self.models_tree.item(model_id, 'values'))
+                values[8] = new_ctx  # context is column index 8 (0-based)
+                self.models_tree.item(model_id, values=values)
+                self.log(f"Context length for '{model.filename or model.name}' set to {new_ctx}")
+                dialog.destroy()
+            except ValueError as e:
+                ttk.Label(dialog, text=f"Invalid value: {e}", foreground='red').pack(padx=15)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=6)
+        ttk.Button(btn_frame, text="Apply", command=_apply).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        entry.bind('<Return>', lambda e: _apply())
+
     def _on_model_select(self, event):
         """Model selection"""
         item = self.models_tree.selection()

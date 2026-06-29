@@ -101,6 +101,7 @@ class AutoUpdater:
             remote_version = data.get('version', '0.0.0')
             
             if is_newer(remote_version, self.current_version):
+                already_notified = self.update_available
                 self.update_available = True
                 self.latest_version = remote_version
                 self.download_url = data.get('download_url')
@@ -109,8 +110,8 @@ class AutoUpdater:
                 
                 logger.info(f"Update available: {self.current_version} -> {remote_version}")
                 
-                # Notify callback
-                if self.callback:
+                # Notify callback only once to avoid multiple dialogs
+                if self.callback and not already_notified:
                     self.callback(
                         self.latest_version,
                         self.changelog,
