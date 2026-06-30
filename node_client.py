@@ -216,7 +216,7 @@ class LlamaProcess:
                 stderr=subprocess.STDOUT,  # Unisci stderr a stdout per catturare tutto
                 shell=use_shell,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True, errors='replace'
             )
         except FileNotFoundError:
             logger.error(f"llama-server command not found: {self.llama_command}")
@@ -1668,7 +1668,7 @@ def detect_gpu():
     """Detect GPU type"""
     # Try NVIDIA
     try:
-        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, errors='replace')
         if result.returncode == 0:
             return 'nvidia'
     except:
@@ -1703,7 +1703,7 @@ def find_llama_binary():
         result = subprocess.run(
             ['llama-server', '--version'],
             capture_output=True,
-            text=True,
+            text=True, errors='replace',
             timeout=5
         )
         if result.returncode == 0 or 'llama' in result.stdout.lower() or 'llama' in result.stderr.lower():

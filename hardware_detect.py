@@ -42,7 +42,7 @@ def get_cpu_info():
             try:
                 result = subprocess.run(
                     ['wmic', 'cpu', 'get', 'NumberOfCores'],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, errors='replace'
                 )
                 for line in result.stdout.strip().split('\n'):
                     if line.strip().isdigit():
@@ -62,7 +62,7 @@ def get_cpu_info():
                         break
                 
                 # Core fisici
-                result = subprocess.run(['lscpu'], capture_output=True, text=True)
+                result = subprocess.run(['lscpu'], capture_output=True, text=True, errors='replace')
                 for line in result.stdout.split('\n'):
                     if 'Core(s) per socket' in line:
                         cores = int(line.split(':')[1].strip())
@@ -114,7 +114,7 @@ def get_ram_info():
             try:
                 speed_result = subprocess.run(
                     ['wmic', 'memorychip', 'get', 'speed'],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, text=True, errors='replace', timeout=10
                 )
                 speeds = []
                 for line in speed_result.stdout.strip().split('\n'):
@@ -130,7 +130,7 @@ def get_ram_info():
             try:
                 type_result = subprocess.run(
                     ['wmic', 'memorychip', 'get', 'SMBIOSMemoryType'],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, text=True, errors='replace', timeout=10
                 )
                 for line in type_result.stdout.strip().split('\n'):
                     line = line.strip()
@@ -169,7 +169,7 @@ def get_ram_info():
             try:
                 speed_result = subprocess.run(
                     ['sudo', 'dmidecode', '-t', 'memory'],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, text=True, errors='replace', timeout=10
                 )
                 for line in speed_result.stdout.split('\n'):
                     if 'Speed:' in line and 'Unknown' not in line and 'Configured' not in line:
@@ -195,7 +195,7 @@ def get_nvidia_gpus():
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=index,name,memory.total,memory.free,driver_version', 
              '--format=csv,noheader,nounits'],
-            capture_output=True, text=True
+            capture_output=True, text=True, errors='replace'
         )
         
         if result.returncode == 0:
@@ -228,7 +228,7 @@ def get_amd_gpus_windows():
         result = subprocess.run(
             ['wmic', 'path', 'win32_VideoController', 'get', 
              'Name,AdapterRAM,DriverVersion', '/format:csv'],
-            capture_output=True, text=True
+            capture_output=True, text=True, errors='replace'
         )
         
         for line in result.stdout.strip().split('\n'):
@@ -263,7 +263,7 @@ def get_amd_gpus_linux():
     try:
         result = subprocess.run(
             ['rocm-smi', '--showmeminfo', 'vram', '--json'],
-            capture_output=True, text=True
+            capture_output=True, text=True, errors='replace'
         )
         
         if result.returncode == 0:
@@ -312,7 +312,7 @@ def get_gpu_info():
                 result = subprocess.run(
                     ['wmic', 'path', 'win32_VideoController', 'get', 
                      'Name,AdapterRAM', '/format:csv'],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, errors='replace'
                 )
                 
                 for line in result.stdout.strip().split('\n')[1:]:
@@ -344,7 +344,7 @@ def get_gpu_info():
                                 'type': gpu_type
                             })
             else:
-                result = subprocess.run(['lspci'], capture_output=True, text=True)
+                result = subprocess.run(['lspci'], capture_output=True, text=True, errors='replace')
                 for line in result.stdout.split('\n'):
                     if 'VGA' in line or '3D' in line:
                         name = line.split(':')[-1].strip()
