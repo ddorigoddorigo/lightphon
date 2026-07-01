@@ -850,7 +850,38 @@ class NodeGUI:
                   font=('Arial', 9), foreground='gray').grid(row=2, column=0, columnspan=4, sticky='w', pady=5)
         
         pricing_frame.columnconfigure(1, weight=1)
-        
+
+        # CPU / Performance settings
+        try:
+            total_cores = os.cpu_count() or 1
+        except Exception:
+            total_cores = 1
+        self._total_cpu_cores = total_cores
+        default_cores = max(1, total_cores - 2)
+
+        cpu_frame = ttk.LabelFrame(self.conn_frame, text="🧵 CPU Cores", padding=10)
+        cpu_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(cpu_frame, text="Cores to use:", font=('Arial', 10)).grid(row=0, column=0, sticky='w', pady=5)
+        self.cpu_threads = tk.StringVar(value=str(default_cores))
+        cpu_spin = ttk.Spinbox(cpu_frame, textvariable=self.cpu_threads, from_=1, to=total_cores,
+                               width=15, font=('Arial', 12))
+        cpu_spin.grid(row=0, column=1, sticky='w', padx=10, pady=5)
+        ttk.Label(cpu_frame, text=f"of {total_cores} available", font=('Arial', 10, 'bold')).grid(row=0, column=2, sticky='w')
+
+        ttk.Button(cpu_frame, text=f"Auto ({default_cores} cores - recommended)",
+                   command=lambda: self.cpu_threads.set(str(default_cores)), width=28).grid(
+                       row=1, column=0, columnspan=2, sticky='w', pady=5)
+
+        ttk.Label(cpu_frame,
+                  text="⚙️ How many CPU cores llama.cpp uses for inference. "
+                       "Default is all cores minus 2 (leaves room for the system). "
+                       "Without this setting llama.cpp would only use ~50% of cores.",
+                  font=('Arial', 9), foreground='gray', wraplength=600, justify='left').grid(
+                      row=2, column=0, columnspan=4, sticky='w', pady=5)
+
+        cpu_frame.columnconfigure(1, weight=1)
+
         # Connection buttons
         btn_frame = ttk.Frame(self.conn_frame)
         btn_frame.pack(pady=20)
@@ -1811,27 +1842,49 @@ class NodeGUI:
                     self.models_tree.delete(model_id)
                     self.log(f"Removed model: {model.name}")
     
-    def _sync_models(self):
-        """Sync models with server"""
+    def _sync_models(self, auto=False):
+        """Sync models with server.
+
+        auto=True is used for the automatic sync on startup/connection: it does
+        not show blocking popups and rescans the folder/HF cache first so that
+        models downloaded on-demand (e.g. via temporary slots) are registered
+        and pushed to the server without a manual click.
+        """
         if not self.client or not self.client.is_connected():
-            messagebox.showwarning("Warning", "Connect to server first")
+            if not auto:
+                messagebox.showwarning("Warning", "Connect to server first")
             return
-        
+
         if not self.model_manager:
-            messagebox.showwarning("Warning", "Scan models first")
+            if not auto:
+                messagebox.showwarning("Warning", "Scan models first")
             return
-        
+
         self.update_status("Syncing models...")
-        
+
         def sync():
             try:
+                # Rescan first so newly downloaded models are picked up and stale
+                # filepaths are refreshed before syncing.
+                try:
+                    self.model_manager.scan_models()
+                    self.root.after(
+                        0,
+                        lambda: self._update_models_list(list(self.model_manager.models.values()))
+                    )
+                except Exception as scan_err:
+                    self.root.after(0, lambda: self.log(f"Scan warning: {scan_err}"))
+
                 models = self.model_manager.get_models_for_server()
+                # Keep the client's model list aligned with what we send.
+                if self.client:
+                    self.client.models = models
                 # Send via WebSocket
                 self.client.sync_models(models)
                 self.root.after(0, lambda: self.update_status(f"Synced {len(models)} models"))
             except Exception as e:
                 self.root.after(0, lambda: self.log(f"Sync error: {e}"))
-        
+
         threading.Thread(target=sync, daemon=True).start()
     
     def _update_disk_info(self):
@@ -1995,6 +2048,14 @@ class NodeGUI:
                 llama_cmd = self.config.get('LLM', 'bin', fallback='llama-server')
             self.llama_command.set(llama_cmd)
             self.gpu_layers.set(self.config.get('LLM', 'gpu_layers', fallback='99'))
+
+            # CPU cores: 0/empty in config means "auto" (all cores - 2)
+            if hasattr(self, 'cpu_threads'):
+                cpu_cfg = self.config.getint('LLM', 'cpu_threads', fallback=0)
+                if cpu_cfg and cpu_cfg > 0:
+                    total = getattr(self, '_total_cpu_cores', cpu_cfg)
+                    self.cpu_threads.set(str(min(cpu_cfg, total)))
+                # else keep the default already set (all cores - 2)
             
             models_dir = self.config.get('Models', 'directory', fallback='')
             print(f"[DEBUG] Models directory from config: '{models_dir}'")
@@ -2043,6 +2104,20 @@ class NodeGUI:
         
         self.config['LLM']['command'] = self.llama_command.get()
         self.config['LLM']['gpu_layers'] = self.gpu_layers.get()
+
+        # Number of CPU cores/threads for inference (default = all cores - 2)
+        if hasattr(self, 'cpu_threads'):
+            cpu_val = self.cpu_threads.get().strip()
+            try:
+                cpu_int = int(cpu_val)
+                if cpu_int < 1:
+                    cpu_int = 1
+                total = getattr(self, '_total_cpu_cores', None)
+                if total:
+                    cpu_int = min(cpu_int, total)
+                self.config['LLM']['cpu_threads'] = str(cpu_int)
+            except (ValueError, TypeError):
+                pass
         
         # Only save models directory if it has a value (don't overwrite with empty)
         current_models_dir = self.models_folder.get()
@@ -2136,9 +2211,11 @@ class NodeGUI:
         self.update_status("Connected to server")
         self.log("Connection established!")
         
-        # Sync models automatically
-        if self.model_manager and self.model_manager.models:
-            self._sync_models()
+        # Sync models automatically on every connection (default behavior on startup).
+        # Runs even if the model list is not yet populated: _sync_models rescans the
+        # folder/HF cache first, so models downloaded via temporary slots are included.
+        if self.model_manager:
+            self._sync_models(auto=True)
     
     def _on_connection_failed(self, error):
         """Connection failed callback"""
@@ -2185,12 +2262,30 @@ class NodeGUI:
         self.status_var.set(msg)
     
     def log(self, msg):
-        """Add to log"""
+        """Add to log (thread-safe: marshals widget updates onto the Tk main thread).
+
+        This is wired as the node client's log callback and is therefore called
+        from background socketio/inference threads; touching Tk widgets off the
+        main thread corrupts the interpreter, so defer the actual write.
+        """
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.config(state='normal')
-        self.log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state='disabled')
+
+        def _append():
+            try:
+                self.log_text.config(state='normal')
+                self.log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
+                self.log_text.see(tk.END)
+                self.log_text.config(state='disabled')
+            except Exception:
+                pass
+
+        # If already on the main thread, Tkinter's after() still safely schedules
+        # the update on the next loop iteration.
+        try:
+            self.root.after(0, _append)
+        except Exception:
+            # Fallback if the root is gone (shutdown)
+            pass
     
     def _clear_log(self):
         """Clear log"""

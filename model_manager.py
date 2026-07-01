@@ -687,7 +687,127 @@ class ModelManager:
             if model.hf_repo and name_lower in model.hf_repo.lower():
                 return model
         return None
-    
+
+    def find_local_gguf_for_repo(self, hf_repo: str, hf_cache_dir: str = None) -> Optional[str]:
+        """
+        Dato un identificatore repo HuggingFace ("owner/repo[:quant_o_subfolder]"),
+        restituisce il path locale al file .gguf (prima shard per i modelli splittati)
+        se il modello e' GIA' presente nella cache HuggingFace / cartella modelli.
+
+        Serve a evitare che uno slot temporaneo faccia ripartire il download via -hf
+        quando il modello e' gia' su disco: in quel caso llama-server va lanciato
+        con -m <path_locale> invece di -hf <repo>.
+
+        Returns:
+            Path assoluto al .gguf locale, oppure None se non presente in cache.
+        """
+        import re as _re
+
+        if not hf_repo:
+            return None
+
+        # 1) Fast path: modello gia' registrato nel ModelManager con filepath valido
+        for m in self.models.values():
+            if m.hf_repo and m.hf_repo.lower() == hf_repo.lower():
+                if m.filepath and os.path.isfile(m.filepath):
+                    logger.info(f"Local cache hit (registered) for {hf_repo}: {m.filepath}")
+                    return m.filepath
+
+        # Parse owner/repo e quant/subfolder opzionale (dopo ':')
+        parts = hf_repo.split(':')
+        repo_part = parts[0]
+        quant = parts[1].strip() if len(parts) > 1 else ''
+        if '/' not in repo_part:
+            return None
+        owner, repo = repo_part.split('/', 1)
+
+        # 2) Cerca direttamente nella/e cache HuggingFace hub sul disco.
+        #    Prova piu' directory candidate: la cartella modelli configurata
+        #    (che qui coincide con l'hub cache), HF_HOME, e il default utente.
+        candidate_dirs = []
+        if hf_cache_dir:
+            candidate_dirs.append(hf_cache_dir)
+        if self.models_dir:
+            candidate_dirs.append(self.models_dir)
+        hf_home = os.environ.get('HF_HOME')
+        if hf_home:
+            candidate_dirs.append(os.path.join(hf_home, 'hub'))
+        candidate_dirs.append(
+            os.path.join(os.path.expanduser('~'), '.cache', 'huggingface', 'hub')
+        )
+
+        seen = set()
+        for base in candidate_dirs:
+            if not base or base in seen:
+                continue
+            seen.add(base)
+
+            model_dir = os.path.join(base, f"models--{owner}--{repo}")
+            snapshots_dir = os.path.join(model_dir, 'snapshots')
+            if not os.path.isdir(snapshots_dir):
+                continue
+
+            snapshots = [
+                s for s in os.listdir(snapshots_dir)
+                if os.path.isdir(os.path.join(snapshots_dir, s))
+            ]
+            if not snapshots:
+                continue
+
+            # Snapshot piu' recente
+            snapshot_hash = sorted(
+                snapshots,
+                key=lambda s: os.path.getmtime(os.path.join(snapshots_dir, s)),
+                reverse=True
+            )[0]
+            snapshot_dir = os.path.join(snapshots_dir, snapshot_hash)
+
+            # Raccogli i .gguf validi (prima shard, escludendo mmproj/clip)
+            candidates = []
+            for root, _dirs, files in os.walk(snapshot_dir):
+                for filename in files:
+                    low = filename.lower()
+                    if not low.endswith('.gguf'):
+                        continue
+                    if 'mmproj' in low or 'clip' in low:
+                        continue
+                    split_match = _re.search(r'-(\d+)-of-(\d+)\.gguf$', filename, _re.IGNORECASE)
+                    if split_match and int(split_match.group(1)) != 1:
+                        continue  # tieni solo la shard 1
+                    candidates.append(os.path.join(root, filename))
+
+            if not candidates:
+                continue
+
+            # Se e' stato indicato un quant/subfolder, preferisci il match esatto
+            if quant:
+                quant_low = quant.lower()
+                for c in candidates:
+                    rel = os.path.relpath(c, snapshot_dir).lower()
+                    if quant_low in rel or quant_low in os.path.basename(c).lower():
+                        logger.info(f"Local cache hit (disk) for {hf_repo}: {c}")
+                        return c
+
+                # Quant richiesto ma NON trovato tra i candidati.
+                # Se c'e' un solo candidato la scelta e' univoca (unica quant in
+                # cache): usalo. Se ce ne sono piu' d'uno con quant diverse, NON
+                # indovinare: restituisci None cosi' il chiamante scarica la quant
+                # corretta via -hf invece di caricare un modello sbagliato.
+                if len(candidates) == 1:
+                    logger.info(f"Local cache hit (disk, single quant) for {hf_repo}: {candidates[0]}")
+                    return candidates[0]
+                logger.info(
+                    f"Requested quant '{quant}' not found in cache for {hf_repo} "
+                    f"({len(candidates)} other quant(s) present); will not guess."
+                )
+                return None
+
+            # Nessun quant specificato: primo candidato disponibile
+            logger.info(f"Local cache hit (disk) for {hf_repo}: {candidates[0]}")
+            return candidates[0]
+
+        return None
+
     def add_huggingface_model(self, hf_repo: str, context_length: int = 4096) -> Optional[ModelInfo]:
         """
         Aggiunge un modello HuggingFace.

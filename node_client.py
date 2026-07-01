@@ -32,6 +32,18 @@ logging.basicConfig(
 logger = logging.getLogger('NodeClient')
 
 
+def get_default_cpu_threads():
+    """Numero di thread CPU di default: 100% dei core logici - 2 (minimo 1).
+
+    Senza questo parametro llama.cpp userebbe circa il 50% dei core.
+    """
+    try:
+        total = os.cpu_count() or 1
+    except Exception:
+        total = 1
+    return max(1, total - 2)
+
+
 class NodeLightning:
     """Gestisce Lightning wallet locale per ricevere pagamenti"""
     
@@ -111,17 +123,19 @@ class NodeLightning:
 class LlamaProcess:
     """Gestisce un processo llama-server (llama.cpp)"""
     
-    def __init__(self, llama_command, model_source, port, context=2048, gpu_layers=99, use_hf=True, log_callback=None):
+    def __init__(self, llama_command, model_source, port, context=2048, gpu_layers=99, use_hf=True, log_callback=None, n_threads=None):
         """
         Args:
             llama_command: Comando per llama-server (es: 'llama-server' o path completo)
-            model_source: Repository HuggingFace (es: 'bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M') 
+            model_source: Repository HuggingFace (es: 'bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M')
                          o path locale al file GGUF
             port: Porta per il server
             context: Context size
             gpu_layers: Layers da caricare su GPU
             use_hf: Se True, usa -hf per scaricare da HuggingFace
             log_callback: Optional callback for logging to GUI
+            n_threads: Numero di thread CPU (core) da usare per l'inferenza.
+                       Se None o <= 0, llama-server usa il suo default interno (~50% dei core).
         """
         self.llama_command = llama_command or 'llama-server'
         self.model_source = model_source
@@ -130,6 +144,12 @@ class LlamaProcess:
         self.context = context
         self.gpu_layers = gpu_layers
         self.use_hf = use_hf
+        try:
+            self.n_threads = int(n_threads) if n_threads is not None else None
+        except (ValueError, TypeError):
+            self.n_threads = None
+        if self.n_threads is not None and self.n_threads <= 0:
+            self.n_threads = None
         self.process = None
         self.is_downloading = False
         self._stop_streaming = False  # Flag per interrompere streaming in corso
@@ -200,6 +220,13 @@ class LlamaProcess:
                 '--embedding'  # Enable embeddings for RAG
             ]
         
+        # Numero di core/thread CPU scelto dall'utente.
+        # Se non specificato, llama.cpp userebbe ~50% dei core: qui usiamo
+        # invece il default 100% dei core - 2.
+        if self.n_threads and self.n_threads > 0:
+            cmd.extend(['--threads', str(self.n_threads)])
+            self._log(f"🧵 Using {self.n_threads} CPU thread(s)/core(s)")
+
         # Log the full command to GUI and logger
         cmd_str = ' '.join(cmd)
         self._log(f"🚀 Executing llama-server command:")
@@ -781,7 +808,17 @@ class NodeClient:
             self.llama_command = self.config.get('LLM', 'bin', fallback='llama-server')
         
         self.gpu_layers = self.config.getint('LLM', 'gpu_layers', fallback=99)
-        
+
+        # Numero di core/thread CPU da usare per llama-server.
+        # Valore 0 / vuoto = automatico (100% dei core - 2). Senza questo
+        # parametro llama.cpp userebbe circa il 50% dei core disponibili.
+        cpu_threads_cfg = self.config.getint('LLM', 'cpu_threads', fallback=0)
+        if cpu_threads_cfg and cpu_threads_cfg > 0:
+            self.cpu_threads = cpu_threads_cfg
+        else:
+            self.cpu_threads = get_default_cpu_threads()
+        logger.info(f"CPU threads for inference: {self.cpu_threads} (default 100% core - 2)")
+
         # Hardware info e modelli (da impostare esternamente)
         self.hardware_info = None
         self.models = []  # Lista modelli per il server
@@ -799,6 +836,13 @@ class NodeClient:
                 }
         
         self.active_sessions = {}  # session_id -> LlamaProcess
+        # Concurrency control for session lifecycle. active_sessions and the
+        # start-tracking structures below are touched from the SocketIO event
+        # thread, the background _do_start threads, inference threads, the local
+        # HTTP server thread and cleanup — all must go through this lock.
+        self._sessions_lock = __import__('threading').RLock()
+        self._current_start_id = None   # session_id of the most recent start request (newest wins)
+        self._starting_llamas = {}      # session_id -> LlamaProcess for in-flight starts
         self.node_id = None
         self.sio = socketio.Client(logger=False, engineio_logger=False)
         self.running = False
@@ -884,22 +928,53 @@ class NodeClient:
                 self.sio.emit('node_models_update', sync_data)
                 logger.info(f"Auto-synced {len(self.models)} models after registration")
         
-        # Track sessions currently being started (prevents duplicate start_session handling)
-        _starting_sessions = set()
-
         @self.sio.on('start_session')
         def on_start_session(data):
             """Richiesta di avviare una sessione"""
             logger.info(f"=== RECEIVED start_session event ===")
             logger.info(f"start_session data: {data}")
 
-            session_id = str(data['session_id'])
-
-            # Guard: ignore duplicate start_session for the same session
-            if session_id in _starting_sessions or session_id in self.active_sessions:
-                logger.warning(f"Ignoring duplicate start_session for {session_id}")
+            # Guard against malformed events without a session id.
+            sid_raw = data.get('session_id') if isinstance(data, dict) else None
+            if sid_raw is None:
+                logger.error("start_session missing 'session_id'; ignoring event")
                 return
-            _starting_sessions.add(session_id)
+            session_id = str(sid_raw)
+
+            # Atomically make this the "current" session and tear down anything
+            # else (active sessions AND older in-flight starts). Only one model
+            # may be loaded at a time, so a newer start supersedes older ones and
+            # older in-flight starts will self-abort when they finish loading.
+            with self._sessions_lock:
+                if session_id in self.active_sessions or session_id == self._current_start_id:
+                    logger.warning(f"Ignoring duplicate start_session for {session_id}")
+                    return
+
+                self._current_start_id = session_id
+
+                # Stop existing active sessions
+                if self.active_sessions:
+                    logger.info(f"Closing {len(self.active_sessions)} existing session(s) before starting new one")
+                    for old_session_id, old_llama in list(self.active_sessions.items()):
+                        logger.info(f"Stopping existing session {old_session_id}")
+                        try:
+                            old_llama.request_stop_streaming()
+                            old_llama.stop()
+                        except Exception as e:
+                            logger.warning(f"Error stopping old session {old_session_id}: {e}")
+                        self.sio.emit('session_stopped', {'session_id': old_session_id})
+                    self.active_sessions.clear()
+
+                # Stop any older in-flight starting processes (prevents two
+                # llama-servers loading at once → VRAM OOM).
+                for old_id, old_llama in list(self._starting_llamas.items()):
+                    if old_id != session_id:
+                        logger.info(f"Aborting in-flight start for superseded session {old_id}")
+                        try:
+                            old_llama.stop()
+                        except Exception:
+                            pass
+                        self._starting_llamas.pop(old_id, None)
 
             model_id = data.get('model_id') or data.get('model')
             model_name = data.get('model_name', model_id)
@@ -914,12 +989,27 @@ class NodeClient:
             model_source = None
             use_hf = False
             
-            # If hf_repo was passed directly, use it for on-demand download
+            # If hf_repo was passed directly (es. slot temporaneo acquistato dal sito),
+            # prima di scaricare da HuggingFace verifica se il modello e' GIA' presente
+            # nella cache locale: in quel caso caricalo dal disco con -m invece di -hf,
+            # cosi' non riparte un download inutile e lo stato non resta su "downloading".
             if hf_repo_direct:
-                model_source = hf_repo_direct
-                use_hf = True
-                logger.info(f"Using direct HuggingFace repo for on-demand download: {model_source}")
-            
+                local_path = None
+                if self.model_manager:
+                    try:
+                        local_path = self.model_manager.find_local_gguf_for_repo(hf_repo_direct)
+                    except Exception as e:
+                        logger.warning(f"Error resolving local cache for {hf_repo_direct}: {e}")
+
+                if local_path and os.path.exists(local_path):
+                    model_source = local_path
+                    use_hf = False
+                    logger.info(f"Model already cached locally, loading from disk: {model_source}")
+                else:
+                    model_source = hf_repo_direct
+                    use_hf = True
+                    logger.info(f"Model not cached locally, using HuggingFace on-demand download: {model_source}")
+
             # Cerca nei modelli config (legacy) - supporta hf_repo
             elif model_name in self.models_config:
                 cfg = self.models_config[model_name]
@@ -992,17 +1082,23 @@ class NodeClient:
             if not model_source:
                 error_msg = f'Model {model_name} (id: {model_id}) not available'
                 logger.error(error_msg)
+                with self._sessions_lock:
+                    if self._current_start_id == session_id:
+                        self._current_start_id = None
                 self.sio.emit('session_error', {
                     'session_id': session_id,
                     'node_id': self.node_id,
                     'error': error_msg
                 })
                 return
-            
+
             # Per modelli locali, verifica che il file esista
             if not use_hf and not os.path.exists(model_source):
                 error_msg = f'Local model file not found: {model_source}'
                 logger.error(error_msg)
+                with self._sessions_lock:
+                    if self._current_start_id == session_id:
+                        self._current_start_id = None
                 self.sio.emit('session_error', {
                     'session_id': session_id,
                     'node_id': self.node_id,
@@ -1010,18 +1106,9 @@ class NodeClient:
                 })
                 return
             
-            # IMPORTANT: Close all existing sessions before starting a new one
-            # (only one model at a time can be loaded)
-            if self.active_sessions:
-                logger.info(f"Closing {len(self.active_sessions)} existing session(s) before starting new one")
-                for old_session_id, old_llama in list(self.active_sessions.items()):
-                    logger.info(f"Stopping existing session {old_session_id}")
-                    old_llama.request_stop_streaming()
-                    old_llama.stop()
-                    # Notify server that session was closed
-                    self.sio.emit('session_stopped', {'session_id': old_session_id})
-                self.active_sessions.clear()
-            
+            # (Existing/older sessions were already stopped atomically at the top
+            # of this handler under self._sessions_lock.)
+
             # Clear RAG when loading a new model (embeddings are model-specific)
             if self.rag_manager.embeddings_cache:
                 logger.info("Clearing RAG knowledge base for new model")
@@ -1044,7 +1131,8 @@ class NodeClient:
                 context,
                 self.gpu_layers,
                 use_hf=use_hf,
-                log_callback=self._gui_log
+                log_callback=self._gui_log,
+                n_threads=getattr(self, 'cpu_threads', None)
             )
             
             # Notify that we are starting (may require download)
@@ -1067,27 +1155,55 @@ class NodeClient:
                 except Exception as e:
                     logger.warning(f"Failed to emit status update: {e}")
 
+            # Register this process as an in-flight start (unless already superseded).
+            with self._sessions_lock:
+                if self._current_start_id != session_id:
+                    logger.info(f"Start for session {session_id} superseded before launch; discarding")
+                    return
+                self._starting_llamas[session_id] = llama
+
             def _do_start():
                 """Run llama.start() in a background thread so SocketIO stays responsive."""
                 try:
-                    if llama.start(download_callback=status_callback):
-                        self.active_sessions[session_id] = llama
+                    ok = llama.start(download_callback=status_callback)
 
+                    with self._sessions_lock:
+                        # If a newer start superseded us while loading, abandon this one.
+                        if self._current_start_id != session_id:
+                            self._starting_llamas.pop(session_id, None)
+                            if ok:
+                                logger.info(f"Session {session_id} finished loading but was superseded; stopping it")
+                                try:
+                                    llama.stop()
+                                except Exception:
+                                    pass
+                            return
+
+                        self._starting_llamas.pop(session_id, None)
+
+                        if ok and not self.sio.connected:
+                            # Socket dropped during load: don't register, tear down.
+                            logger.warning("Cannot emit session_started: socket disconnected")
+                            try:
+                                llama.stop()
+                            except Exception:
+                                pass
+                            return
+
+                        if ok:
+                            self.active_sessions[session_id] = llama
+
+                    if ok:
                         # Track model usage - increment use_count
                         if self.model_manager and model_id:
                             self.model_manager.mark_model_used(model_id)
                             logger.info(f"Updated usage stats for model {model_id}")
 
-                        if self.sio.connected:
-                            self.sio.emit('session_started', {
-                                'session_id': session_id,
-                                'node_id': self.node_id,
-                                'status': 'ready'
-                            })
-                        else:
-                            logger.warning(f"Cannot emit session_started: socket disconnected")
-                            llama.stop()
-                            self.active_sessions.pop(session_id, None)
+                        self.sio.emit('session_started', {
+                            'session_id': session_id,
+                            'node_id': self.node_id,
+                            'status': 'ready'
+                        })
                     else:
                         if self.sio.connected:
                             self.sio.emit('session_error', {
@@ -1098,7 +1214,11 @@ class NodeClient:
                         else:
                             logger.warning(f"Cannot emit session_error: socket disconnected")
                 finally:
-                    _starting_sessions.discard(session_id)
+                    with self._sessions_lock:
+                        # Clear the current-start marker if it's still us and we
+                        # never became an active session (failure/supersede path).
+                        if self._current_start_id == session_id and session_id not in self.active_sessions:
+                            self._current_start_id = None
 
             import threading as _threading_mod
             _threading_mod.Thread(target=_do_start, daemon=True).start()
@@ -1106,26 +1226,37 @@ class NodeClient:
         @self.sio.on('stop_session')
         def on_stop_session(data):
             """Richiesta di fermare una sessione"""
-            session_id = str(data['session_id'])
+            sid_raw = data.get('session_id') if isinstance(data, dict) else None
+            if sid_raw is None:
+                logger.error("stop_session missing 'session_id'; ignoring event")
+                return
+            session_id = str(sid_raw)
             logger.info(f"[STOP_SESSION] Received stop_session request for session {session_id}")
-            logger.info(f"[STOP_SESSION] Active sessions: {list(self.active_sessions.keys())}")
-            
-            if session_id in self.active_sessions:
-                llama_process = self.active_sessions[session_id]
+
+            # Atomically remove the session (and cancel it if it's still starting).
+            with self._sessions_lock:
+                llama_process = self.active_sessions.pop(session_id, None)
+                # Also cancel an in-flight start for this id.
+                if self._current_start_id == session_id:
+                    self._current_start_id = None
+                starting = self._starting_llamas.pop(session_id, None)
+
+            if starting is not None and starting is not llama_process:
+                try:
+                    starting.stop()
+                except Exception:
+                    pass
+
+            if llama_process is not None:
                 logger.info(f"[STOP_SESSION] Found session {session_id}, stopping llama-server process...")
-                
-                # Prima richiedi lo stop dello streaming (se in corso)
-                llama_process.request_stop_streaming()
-                
-                # Poi ferma il processo
-                llama_process.stop()
-                
-                # Rimuovi dalla lista delle sessioni attive
-                del self.active_sessions[session_id]
-                
+                try:
+                    llama_process.request_stop_streaming()
+                    llama_process.stop()
+                except Exception as e:
+                    logger.warning(f"Error stopping session {session_id}: {e}")
+
                 logger.info(f"[STOP_SESSION] Session {session_id} stopped - llama-server process terminated")
-                logger.info(f"[STOP_SESSION] Remaining active sessions: {list(self.active_sessions.keys())}")
-                
+
                 # Notify GUI that session was stopped
                 if self.gui_session_ended_callback:
                     try:
@@ -1134,25 +1265,27 @@ class NodeClient:
                         logger.error(f"GUI session ended callback error: {e}")
             else:
                 logger.warning(f"[STOP_SESSION] Session {session_id} not found in active sessions")
-            
+
             self.sio.emit('session_stopped', {'session_id': session_id})
-        
+
         @self.sio.on('stop_generation')
         def on_stop_generation(data):
             """Richiesta di fermare la generazione in corso (senza terminare la sessione)"""
-            session_id = str(data['session_id'])
+            sid_raw = data.get('session_id') if isinstance(data, dict) else None
+            if sid_raw is None:
+                logger.error("stop_generation missing 'session_id'; ignoring event")
+                return
+            session_id = str(sid_raw)
             logger.info(f"[STOP_GENERATION] Received stop_generation request for session {session_id}")
-            
-            if session_id in self.active_sessions:
-                llama_process = self.active_sessions[session_id]
+
+            with self._sessions_lock:
+                llama_process = self.active_sessions.get(session_id)
+
+            if llama_process is not None:
                 logger.info(f"[STOP_GENERATION] Stopping streaming for session {session_id}")
-                
                 # Solo ferma lo streaming, non il processo
                 llama_process.request_stop_streaming()
-                
                 logger.info(f"[STOP_GENERATION] Generation stopped for session {session_id}")
-                
-                # Notifica che la generazione è stata fermata
                 self.sio.emit('generation_stopped', {'session_id': session_id})
             else:
                 logger.warning(f"[STOP_GENERATION] Session {session_id} not found in active sessions")
@@ -1173,7 +1306,11 @@ class NodeClient:
         @self.sio.on('inference_request')
         def on_inference(data):
             """Inference request with streaming - uses messages format for /v1/chat/completions"""
-            session_id = str(data['session_id'])
+            sid_raw = data.get('session_id') if isinstance(data, dict) else None
+            if sid_raw is None:
+                logger.error("inference_request missing 'session_id'; ignoring event")
+                return
+            session_id = str(sid_raw)
             messages = data.get('messages', [])
             
             # Backward compatibility: if 'prompt' is sent instead of 'messages', convert it
@@ -1218,15 +1355,15 @@ class NodeClient:
             logger.info(f"Full LLM params: max_tokens={max_tokens}, repeat_penalty={repeat_penalty}, presence={presence_penalty}, frequency={frequency_penalty}")
             logger.info(f"DRY params: mult={dry_multiplier}, base={dry_base}, XTC: thresh={xtc_threshold}, prob={xtc_probability}")
             
-            if session_id not in self.active_sessions:
+            with self._sessions_lock:
+                llama = self.active_sessions.get(session_id)
+            if llama is None:
                 self.sio.emit('inference_error', {
                     'session_id': session_id,
                     'error': 'Session not found'
                 })
                 return
-            
-            llama = self.active_sessions[session_id]
-            
+
             # RAG: Inject relevant context as system message if enabled
             rag_chunks_used = []
             # Extract the last user message for RAG query
@@ -1407,14 +1544,15 @@ class NodeClient:
             
             logger.info(f"RAG: Adding document '{filename}' ({len(content)} chars)")
             
-            if session_id not in self.active_sessions:
+            with self._sessions_lock:
+                llama = self.active_sessions.get(session_id)
+            if llama is None:
                 self.sio.emit('rag_error', {
                     'session_id': session_id,
                     'error': 'Session not found. Load a model first.'
                 })
                 return
-            
-            llama = self.active_sessions[session_id]
+
             self.rag_manager.set_llama_port(llama.port)
             
             def add_doc():
@@ -1531,9 +1669,12 @@ class NodeClient:
             data = request.get_json()
             session_id = str(data.get('session_id'))
             
-            if session_id in node_client.active_sessions:
-                node_client.active_sessions[session_id].stop()
-                del node_client.active_sessions[session_id]
+            with node_client._sessions_lock:
+                llama_process = node_client.active_sessions.pop(session_id, None)
+                if node_client._current_start_id == session_id:
+                    node_client._current_start_id = None
+            if llama_process is not None:
+                llama_process.stop()
                 logger.info(f"Session {session_id} stopped via HTTP")
                 return jsonify({'success': True})
             
@@ -1622,18 +1763,24 @@ class NodeClient:
     
     def cleanup_all_sessions(self):
         """Ferma tutte le sessioni llama-server attive"""
-        if not self.active_sessions:
+        with self._sessions_lock:
+            sessions = list(self.active_sessions.items())
+            starting = list(self._starting_llamas.items())
+            self.active_sessions.clear()
+            self._starting_llamas.clear()
+            self._current_start_id = None
+
+        if not sessions and not starting:
             return
-        
-        logger.info(f"Cleaning up {len(self.active_sessions)} active session(s)...")
-        for session_id, llama in list(self.active_sessions.items()):
+
+        logger.info(f"Cleaning up {len(sessions)} active + {len(starting)} starting session(s)...")
+        for session_id, llama in sessions + starting:
             try:
                 logger.info(f"Stopping llama-server for session {session_id}")
                 llama.request_stop_streaming()
                 llama.stop()
             except Exception as e:
                 logger.error(f"Error stopping session {session_id}: {e}")
-        self.active_sessions.clear()
         logger.info("All sessions cleaned up")
     
     def disconnect(self):

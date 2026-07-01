@@ -35,6 +35,11 @@ command = llama-server
 gpu_layers = 99
 port_start = 11000
 port_end = 12000
+; Number of CPU cores/threads used by llama.cpp for inference.
+; 0 (or leave empty) = automatic: uses all logical cores minus 2.
+; Without this setting llama.cpp would only use ~50% of the cores.
+; Set a specific number (e.g. 4) to cap CPU usage.
+cpu_threads = 0
 
 [Models]
 ; Directory for local GGUF models (optional)
